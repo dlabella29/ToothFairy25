@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+Batch remap labels inside NIfTI *.nii.gz files.
+
+Input folder:
+  /media/dlabella29/Extreme Pro/Grand Challenge Data/ToothFairy3/cropped2/labels_cropped2/
+
+Default output:
+  <input>/remapped/   (created if missing)
+
+Behavior:
+  - Only relabels values explicitly listed in MAP_LIST; all other labels remain unchanged.
+  - Preserves affine, header, and qform/sform codes.
+  - Handles non-integer images by rounding to nearest int with a warning.
+  - Detects duplicate mapping rules (e.g., 43→7 and 43→11) and applies the
+    policy set in DUPLICATE_POLICY: "last" (default), "first", or "error".
+
+Requirements:
+  pip install nibabel numpy tqdm
+"""
+
+from pathlib import Path
+import numpy as np
+import nibabel as nib
+from tqdm import tqdm
+import warnings
+
+# ============================== USER CONFIG ==============================
+INPUT_DIR  = Path(r"/media/dlabella29/Extreme Pro/Grand Challenge Data/ToothFairy3/cropped3/labels_cropped/")
+OUTPUT_DIR = INPUT_DIR / "remapped"   # change to INPUT_DIR for in-place overwrite (not recommended)
+OVERWRITE  = True                     # if False, will skip existing outputs
+DUPLICATE_POLICY = "last"             # "last" | "first" | "error"
+# -------------------------------------------------------------------------
+# Your mapping rules (order matters only for duplicate handling):
+MAP_LIST = [
+    (46, 2),
+    (45, 5),
+    (44, 6),
+    (43, 7),
+    (42, 11),
+    (41, 12),
+    (40, 13),
+    (36, 14),
+    (35, 15),
+    (34, 16),
+    (33, 17),
+    (32, 18),
+    (31, 21),
+    (30, 22),
+    (29, 23),
+]
+# ============================ END USER CONFIG ============================
+
+def build_mapping(map_list, policy="last"):
+    """Resolve (src,dst) list into a dict, handling duplicates per policy."""
+    seen = {}
+    collisions = {}
+    for src, dst in map_list:
+        if src in seen and seen[src] != dst:
+            collisions.setdefault(src, set()).update({seen[src], dst})
+        if policy == "first":
+            if src not in seen:
+                seen[src] = dst
+        elif policy == "last":
+            seen[src] = dst
+        elif policy == "error":
+            if src in seen and seen[src] != dst:
+                raise ValueError(f"Duplicate mapping for {src}: {seen[src]} vs {dst}")
+            seen[src] = dst
+        else:
+            raise ValueError(f"Unknown DUPLICATE_POLICY: {policy}")
+
+    if collisions:
+        msg = "; ".join([f"{k}: {sorted(list(v))}" for k, v in collisions.items()])
+        warnings.warn(f"Duplicate mapping(s) detected and resolved by policy='{policy}': {msg}")
+
+    return seen
+
+def load_label_array(img_path: Path) -> tuple[np.ndarray, nib.Nifti1Header, np.ndarray]:
+    img = nib.load(str(img_path))
+    arr = np.asarray(img.dataobj)
+    if not np.issubdtype(arr.dtype, np.integer):
+        warnings.warn(f"{img_path.name}: dtype {arr.dtype} is not integer. Rounding to nearest int.")
+        arr = np.rint(arr).astype(np.int64, copy=False)
+    else:
+        arr = arr.astype(np.int64, copy=False)
+
+    hdr = img.header.copy()
+    aff = img.affine.copy()
+    return arr, hdr, aff
+
+def save_nifti_like(out_path: Path, data: np.ndarray, header: nib.Nifti1Header, affine: np.ndarray):
+    # Ensure an integer dtype (choose int16 if safe; otherwise int32)
+    max_val = int(data.max())
+    min_val = int(data.min())
+    if min_val >= np.iinfo(np.int16).min and max_val <= np.iinfo(np.int16).max:
+        data = data.astype(np.int16, copy=False)
+        header.set_data_dtype(np.int16)
+    else:
+        data = data.astype(np.int32, copy=False)
+        header.set_data_dtype(np.int32)
+
+    # Preserve qform/sform codes when possible
+    out_img = nib.Nifti1Image(data, affine, header=header)
+    nib.save(out_img, str(out_path))
+
+def remap_labels_in_array(arr: np.ndarray, mapping: dict[int, int]) -> tuple[np.ndarray, dict[int, int]]:
+    """Apply mapping in one pass; returns remapped array and counts changed voxels per source."""
+    out = arr.copy()
+    changed_counts = {}
+    # Only touch labels that exist in the array
+    present_labels = set(np.unique(arr).tolist())
+    targets = present_labels.intersection(mapping.keys())
+    for src in targets:
+        mask = (out == src)
+        cnt = int(mask.sum())
+        if cnt > 0:
+            out[mask] = mapping[src]
+            changed_counts[src] = cnt
+    return out, changed_counts
+
+def main():
+    if not INPUT_DIR.is_dir():
+        raise SystemExit(f"Input folder not found: {INPUT_DIR}")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    mapping = build_mapping(MAP_LIST, policy=DUPLICATE_POLICY)
+    print("Resolved mapping:", mapping)
+
+    files = sorted(INPUT_DIR.glob("*.nii.gz"))
+    if not files:
+        raise SystemExit(f"No .nii.gz files found in: {INPUT_DIR}")
+
+    total_changed = 0
+    for fp in tqdm(files, desc="Remapping"):
+        rel_out = OUTPUT_DIR / fp.name
+        if rel_out.exists() and not OVERWRITE:
+            continue
+
+        arr, hdr, aff = load_label_array(fp)
+        remapped, changed_counts = remap_labels_in_array(arr, mapping)
+
+        # Skip writing if nothing changed (but still allow overwrite control)
+        if (changed_counts or OVERWRITE) or (not rel_out.exists()):
+            save_nifti_like(rel_out, remapped, hdr, aff)
+
+        changed_here = sum(changed_counts.values())
+        total_changed += changed_here
+        changed_str = ", ".join([f"{k}->{mapping[k]}: {v}" for k, v in sorted(changed_counts.items())]) or "no affected voxels"
+        print(f"{fp.name}: {changed_here} voxels remapped ({changed_str}) -> {rel_out}")
+
+    print(f"\nDone. Files processed: {len(files)} | Total voxels remapped: {total_changed}")
+    print(f"Outputs written to: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()

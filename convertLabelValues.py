@@ -8,9 +8,9 @@ def remap_labels(arr: np.ndarray) -> np.ndarray:
     1) Apply the original ToothFairy3→Grand-Challenge mapping:
        103→51, 104→52, 105→53, 111–148→50
     2) Then apply the post-processing remaps:
-       53 → 19
-       52 → 20
-       51 → 29
+       53 → 19 lingual
+       52 → 20 left nerve
+       51 → 29 right nerve
        50 → 30
        48 → 39
        47 → 40
